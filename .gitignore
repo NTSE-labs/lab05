@@ -5,3 +5,7 @@ __pycache__/
 output/
 *.log
 test
+build
+test
+NTSE_Lab05.spec
+NTSE_Lab05.exe
