@@ -126,7 +126,12 @@ def get_image_properties(image_path: Path) -> tuple[int, int, int]:
 
 def create_analysis_dataframe(dataset_dir: Path) -> pd.DataFrame:
     """Добавляет числовые метки и характеристики изображений для анализа."""
-    dataframe = create_annotation_dataframe(dataset_dir)
+    return add_image_metadata(create_annotation_dataframe(dataset_dir))
+
+
+def add_image_metadata(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Читает размеры изображений, не изменяя исходную аннотацию."""
+    dataframe = dataframe.copy()
     dataframe["class_label"] = dataframe["class_name"].map(CLASS_TO_LABEL).astype(int)
     properties = [get_image_properties(Path(path)) for path in dataframe["absolute_path"]]
     dataframe["height"] = [item[0] for item in properties]
@@ -134,6 +139,31 @@ def create_analysis_dataframe(dataset_dir: Path) -> pd.DataFrame:
     dataframe["channels"] = [item[2] for item in properties]
     dataframe["pixel_count"] = dataframe["height"] * dataframe["width"]
     return dataframe
+
+
+class DatasetAnalysis:
+    """Лениво читает размеры и сбрасывает кеш при изменении файлов датасета."""
+
+    def __init__(self, dataset_dir: Path) -> None:
+        self.dataset_dir = Path(dataset_dir).expanduser().resolve()
+        self._signature: tuple[tuple[Path, int, int], ...] | None = None
+        self._annotation: pd.DataFrame | None = None
+        self._metadata: pd.DataFrame | None = None
+
+    def dataframe(self, dimensions: bool = False) -> pd.DataFrame:
+        paths = find_image_files(self.dataset_dir)
+        signature = tuple((path, stat.st_size, stat.st_mtime_ns) for path in paths for stat in [path.stat()])
+        if signature != self._signature:
+            annotation = create_annotation_dataframe(self.dataset_dir)
+            self._annotation = annotation
+            self._metadata = None
+            self._signature = signature
+        assert self._annotation is not None
+        if dimensions:
+            if self._metadata is None:
+                self._metadata = add_image_metadata(self._annotation)
+            return self._metadata.copy()
+        return self._annotation.copy()
 
 
 def class_counts(dataframe: pd.DataFrame) -> pd.Series:

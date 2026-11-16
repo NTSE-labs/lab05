@@ -7,23 +7,23 @@ import base64
 from pathlib import Path
 import sys
 
-import pandas as pd
 import flet as ft
 
 from dataset_service import (
-    calculate_color_histogram,
+    DatasetAnalysis,
     class_counts,
     copy_dataset_with_class_names,
     copy_dataset_with_random_names,
-    create_analysis_dataframe,
     create_source_manifest,
     filter_by_class,
     filter_by_class_and_dimensions,
-    get_class_balance_text,
+    describe_dimensions,
+    pixel_statistics,
     make_class_balance_plot,
     make_color_histogram_plot,
     save_dataframe,
 )
+from iterators import ClassIterator
 from scraper_runner import find_lab01_script
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -39,8 +39,10 @@ def main(page: ft.Page) -> None:
     page.scroll = ft.ScrollMode.AUTO
 
     dataset_dir: Path | None = DEFAULT_DATASET if DEFAULT_DATASET.is_dir() else None
-    analysis_df = None
-    next_index = {"cat": 0, "dog": 0}
+    analysis_session = DatasetAnalysis(dataset_dir) if dataset_dir else None
+    analysis_busy = False
+    viewer_iterators = {}
+    viewer_positions = {}
     viewer_annotations: dict[str, Path | None] = {
         "original": None,
         "class_named": None,
@@ -60,7 +62,8 @@ def main(page: ft.Page) -> None:
     image_path_text = ft.Text("Изображение ещё не выбрано.", selectable=True)
     image_preview = ft.Image(src="", visible=False, width=500, height=330,
                              fit=ft.BoxFit.CONTAIN)
-    analysis_text = ft.Text("Нажмите «Выполнить анализ датасета».", selectable=True)
+    analysis_text = ft.Text("Выберите действие анализа.", selectable=True)
+    histogram_number = ft.TextField(label="Номер изображения для гистограммы", value="1", width=300)
     chart_preview = ft.Image(src="", visible=False, width=700, height=370,
                              fit=ft.BoxFit.CONTAIN)
     class_selector = ft.Dropdown(
@@ -88,12 +91,16 @@ def main(page: ft.Page) -> None:
         page.update()
 
     async def choose_dataset(event: ft.ControlEvent) -> None:
-        nonlocal dataset_dir, analysis_df
+        nonlocal dataset_dir, analysis_session
+        if analysis_busy:
+            return
         try:
             selected = await source_picker.get_directory_path(
                 dialog_title="Выберите корневую папку dataset (внутри cat и dog)"
             )
             if selected is None:
+                return
+            if analysis_busy:
                 return
             candidate = Path(selected).expanduser().resolve()
             if not candidate.is_dir():
@@ -101,10 +108,15 @@ def main(page: ft.Page) -> None:
             if not any((candidate / label).is_dir() for label in ("cat", "dog")):
                 raise ValueError("В выбранной папке должны быть подпапки cat и/или dog.")
             dataset_dir = candidate
-            analysis_df = None
+            analysis_session = DatasetAnalysis(dataset_dir)
+            analysis_text.value = "Выберите действие анализа."
+            chart_preview.visible = False
+            image_preview.visible = False
+            image_path_text.value = "Изображение ещё не выбрано."
             viewer_annotations.update(original=None, class_named=None, random=None)
             viewer_selector.value = "original"
-            next_index.update(cat=0, dog=0)
+            viewer_iterators.clear()
+            viewer_positions.clear()
             dataset_label.value = f"Выбран датасет: {dataset_dir}"
             set_status("Датасет выбран.")
         except (OSError, ValueError) as error:
@@ -190,7 +202,8 @@ def main(page: ft.Page) -> None:
                 count = copy_dataset_with_random_names(dataset_dir, output, annotations)
                 viewer_annotations["random"] = annotations.resolve()
                 viewer_selector.value = "random"
-            next_index.update(cat=0, dog=0)
+            viewer_iterators.clear()
+            viewer_positions.clear()
             set_status(f"Создано файлов: {count}. Копия: {output}. CSV: {annotations}")
         except (OSError, ValueError) as error:
             set_status(f"Не удалось создать копию: {error}", True)
@@ -216,24 +229,18 @@ def main(page: ft.Page) -> None:
                         "Сначала создайте выбранную копию датасета: "
                         "для неё пока нет CSV-аннотации."
                     )
-                annotation = pd.read_csv(annotation_path)
-                paths = sorted(
-                    Path(value).expanduser().resolve()
-                    for value in annotation.loc[
-                        annotation["class_name"] == class_name, "absolute_path"
-                    ].dropna().astype(str)
-                )
-            else:
-                paths = sorted(
-                    p.resolve() for p in (dataset_dir / class_name).glob("*")
-                    if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-                )
-            if not paths:
-                set_status(f"В выбранном наборе нет изображений класса {class_name}.", True)
-                return
-            index = next_index[class_name] % len(paths)
-            path = paths[index]
-            next_index[class_name] = index + 1
+            key = (viewer_key, class_name)
+            if key not in viewer_iterators:
+                viewer_iterators[key] = ClassIterator(class_name, dataset_dir, annotation_path)
+                viewer_positions[key] = 0
+            path = next(viewer_iterators[key], None)
+            if path is None:
+                viewer_iterators[key] = ClassIterator(class_name, dataset_dir, annotation_path)
+                viewer_positions[key] = 0
+                path = next(viewer_iterators[key], None)
+            if path is None:
+                raise ValueError(f"В выбранном наборе нет изображений класса {class_name}.")
+            viewer_positions[key] += 1
             if not path.is_file():
                 raise FileNotFoundError(f"Изображение не найдено: {path}")
             content = path.read_bytes()
@@ -243,7 +250,7 @@ def main(page: ft.Page) -> None:
             image_preview.visible = True
             image_path_text.value = str(path)
             set_status(
-                f"Изображение {index + 1} из {len(paths)} класса {class_name}; "
+                f"Изображение {viewer_positions[key]} класса {class_name}; "
                 f"набор: {viewer_key}."
             )
         except (OSError, ValueError) as error:
@@ -252,90 +259,91 @@ def main(page: ft.Page) -> None:
             set_status(f"Ошибка просмотра изображения: {error}", True)
         page.update()
 
-    async def analyze_dataset(event: ft.ControlEvent) -> None:
-        nonlocal analysis_df
-        if dataset_dir is None:
+    def perform_analysis(action: str, session: DatasetAnalysis, selected_class: str,
+                         width_text: str, height_text: str, image_number: str):
+        """Вычисления в рабочем потоке без обращения к контролам."""
+        root = session.dataset_dir.parent
+        if action == "histogram":
+            number = int(image_number.strip())
+            rows = filter_by_class(session.dataframe(), selected_class)
+            paths = sorted(Path(value) for value in rows["absolute_path"])
+            if not 1 <= number <= len(paths):
+                raise ValueError(f"Номер изображения должен быть от 1 до {len(paths)} для {selected_class}.")
+            path = paths[number - 1]
+            return f"Гистограмма изображения: {path}", make_color_histogram_plot(path), "Гистограмма построена."
+        if action == "filter_dimensions":
+            width, height = int(width_text.strip()), int(height_text.strip())
+            if width <= 0 or height <= 0:
+                raise ValueError("Максимальная ширина и высота должны быть больше нуля.")
+            result = filter_by_class_and_dimensions(session.dataframe(True), selected_class, width, height)
+            if result.empty:
+                message = (
+                    f"Изображения класса {selected_class} с размерами не более "
+                    f"{width}×{height} не найдены. CSV не создан."
+                )
+                return message, None, message
+            output = root / f"filtered_{selected_class}_{width}x{height}.csv"
+        elif action == "filter_class":
+            result = filter_by_class(session.dataframe(), selected_class)
+            output = root / f"filtered_{selected_class}.csv"
+        elif action == "export":
+            result = session.dataframe(True)
+            output = root / "analysis_dataframe.csv"
+        elif action == "counts":
+            counts = class_counts(session.dataframe())
+            balance = "Классы сбалансированы." if counts.nunique() == 1 else "Классы не сбалансированы."
+            text = f"Всего изображений: {int(counts.sum())}\n{counts.to_string()}\n{balance}"
+            return text, None, "Количество изображений подсчитано."
+        elif action == "balance":
+            return "Количество изображений по классам", make_class_balance_plot(session.dataframe()), "Диаграмма построена."
+        elif action == "dimensions":
+            return describe_dimensions(session.dataframe(True)).round(2).to_string(), None, "Статистика размеров рассчитана."
+        elif action == "pixels":
+            return pixel_statistics(session.dataframe(True)).round(2).to_string(), None, "Статистика пикселей рассчитана."
+        else:
+            raise ValueError(f"Неизвестное действие: {action}")
+        save_dataframe(result, output)
+        return f"Строк: {len(result)}. CSV: {output}", None, "CSV сохранён."
+
+    async def run_analysis(action: str) -> None:
+        nonlocal analysis_busy
+        if analysis_busy:
+            return
+        if analysis_session is None:
             set_status("Сначала выберите датасет.", True)
             return
+        analysis_busy = True
+        for button in analysis_buttons:
+            button.disabled = True
         try:
-            analysis_df = create_analysis_dataframe(dataset_dir)
-            analysis_file = dataset_dir.parent / "analysis_dataframe.csv"
-            save_dataframe(analysis_df, analysis_file)
-            source_manifest = create_source_manifest(dataset_dir)
-            save_dataframe(source_manifest, dataset_dir.parent / "source_files.csv")
-            analysis_text.value = get_class_balance_text(analysis_df)
-            chart_preview.src = base64.b64encode(make_class_balance_plot(analysis_df)).decode("ascii")
-            chart_preview.visible = True
-            set_status(
-                f"Анализ завершён: {len(analysis_df)} изображений. "
-                f"CSV: {analysis_file}"
+            set_status("Выполняется выбранное действие…")
+            text, chart, message = await asyncio.to_thread(
+                perform_analysis, action, analysis_session, class_selector.value or "cat",
+                max_width_field.value or "", max_height_field.value or "", histogram_number.value or "",
             )
-        except (FileNotFoundError, OSError, ValueError, KeyError) as error:
-            set_status(f"Не удалось выполнить анализ: {error}", True)
+            analysis_text.value = text
+            chart_preview.visible = chart is not None
+            if chart is not None:
+                chart_preview.src = base64.b64encode(chart).decode("ascii")
+            set_status(message)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            set_status(f"Не удалось выполнить действие: {error}", True)
         except Exception as error:
             set_status(f"Ошибка анализа: {error}", True)
-        page.update()
+        finally:
+            analysis_busy = False
+            for button in analysis_buttons:
+                button.disabled = False
+            page.update()
 
-    async def filter_current_class(event: ft.ControlEvent) -> None:
-        if analysis_df is None:
-            set_status("Сначала выполните анализ датасета.", True)
-            return
-        try:
-            selected_class = class_selector.value or "cat"
-            result = filter_by_class(analysis_df, selected_class)
-            output = dataset_dir.parent / f"filtered_{selected_class}.csv"
-            save_dataframe(result, output)
-            set_status(f"Для класса {selected_class} найдено {len(result)} строк. CSV: {output}")
-        except (OSError, ValueError, TypeError) as error:
-            set_status(f"Не удалось отфильтровать данные: {error}", True)
+    analysis_buttons = []
 
-    async def filter_dimensions(event: ft.ControlEvent) -> None:
-        if analysis_df is None or dataset_dir is None:
-            set_status("Сначала выполните анализ датасета.", True)
-            return
-        try:
-            # Не превращаем некорректный ввод в ноль: показываем понятную ошибку.
-            max_width = int((max_width_field.value or "").strip())
-            max_height = int((max_height_field.value or "").strip())
-            selected_class = class_selector.value or "cat"
-            result = filter_by_class_and_dimensions(
-                analysis_df, selected_class, max_width, max_height
-            )
-            output = dataset_dir.parent / f"filtered_{selected_class}_{max_width}x{max_height}.csv"
-            save_dataframe(result, output)
-            set_status(f"После фильтрации: {len(result)} изображений. CSV: {output}")
-        except (ValueError, TypeError) as error:
-            set_status(f"Проверьте введённые размеры: {error}", True)
-        except OSError as error:
-            set_status(f"Не удалось сохранить результат фильтрации: {error}", True)
-
-    async def show_color_histogram(event: ft.ControlEvent) -> None:
-        if dataset_dir is None:
-            set_status("Сначала выберите датасет.", True)
-            return
-        try:
-            selected_class = class_selector.value or "cat"
-            class_dir = dataset_dir / selected_class
-            paths = sorted(
-                p for p in class_dir.glob("*")
-                if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-            )
-            if not paths:
-                raise ValueError(f"В классе {selected_class} нет изображений.")
-            # Последовательно выбираем очередное изображение, чтобы результат менялся.
-            path = paths[next_index[selected_class] % len(paths)]
-            next_index[selected_class] += 1
-            histogram = calculate_color_histogram(path)
-            if not histogram or any(values.size != 256 for values in histogram):
-                raise ValueError("Гистограмма имеет неожиданный формат.")
-            chart_preview.src = base64.b64encode(make_color_histogram_plot(path)).decode("ascii")
-            chart_preview.visible = True
-            set_status(f"Показана цветовая гистограмма для: {path.name}")
-        except (OSError, ValueError) as error:
-            set_status(f"Не удалось построить гистограмму: {error}", True)
-        except Exception as error:
-            set_status(f"Ошибка построения гистограммы: {error}", True)
-        page.update()
+    def analysis_button(title: str, action: str) -> ft.Button:
+        async def on_click(event: ft.ControlEvent) -> None:
+            await run_analysis(action)
+        button = ft.Button(content=title, on_click=on_click)
+        analysis_buttons.append(button)
+        return button
 
     page.add(
         ft.Text("Обработка и анализ датасета кошек и собак", size=27, weight=ft.FontWeight.BOLD),
@@ -366,12 +374,18 @@ def main(page: ft.Page) -> None:
         ft.Divider(),
         ft.Text("3. Исследовательский анализ (лаба 4)", size=21, weight=ft.FontWeight.BOLD),
         ft.Row([
-            ft.Button(content="Выполнить анализ датасета", on_click=analyze_dataset),
-            ft.Button(content="Фильтр по классу", on_click=filter_current_class),
-            ft.Button(content="Построить цветовую гистограмму", on_click=show_color_histogram),
+            analysis_button("Количество и баланс классов", "counts"),
+            analysis_button("Статистика размеров", "dimensions"),
+            analysis_button("Статистика пикселей по классам", "pixels"),
+            analysis_button("Диаграмма баланса", "balance"),
+            analysis_button("Сохранить таблицу анализа CSV", "export"),
         ], wrap=True),
-        ft.Row([class_selector, max_width_field, max_height_field,
-                ft.Button(content="Фильтр по классу и размерам", on_click=filter_dimensions)], wrap=True),
+        ft.Text("Размеры читаются при первом запросе; при изменении файлов пересчитываются."),
+        ft.Row([class_selector, analysis_button("Фильтр по классу → CSV", "filter_class")], wrap=True),
+        ft.Row([max_width_field, max_height_field,
+                analysis_button("Фильтр по классу и размерам → CSV", "filter_dimensions")], wrap=True),
+        ft.Text("Гистограмма одного изображения: номер в отсортированном списке выбранного класса."),
+        ft.Row([histogram_number, analysis_button("Построить цветовую гистограмму", "histogram")], wrap=True),
         analysis_text,
         chart_preview,
         ft.Divider(),
